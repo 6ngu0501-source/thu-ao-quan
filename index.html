@@ -40,6 +40,14 @@
     background: rgba(0, 0, 0, .65); border-radius: 10px; font-size: 14px; text-align: center;
   }
   .hint[hidden] { display: none; }
+  .badge {
+    position: absolute; left: 10px; top: 10px; padding: 4px 10px; border-radius: 999px;
+    background: rgba(0, 0, 0, .6); font-size: 12px; border: 1px solid rgba(255,255,255,.18);
+  }
+  .badge[hidden] { display: none; }
+  .badge::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #ff7a7a; }
+  .badge[data-state=ok]::before { background: #5fd38d; }
+  .badge[data-state=pred]::before { background: #ffb454; }
   .bar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
   button, .filebtn {
     font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
@@ -99,11 +107,13 @@
         <button class="primary" id="startBtn">Bật webcam</button>
         <p id="status">Hình ảnh chỉ được xử lý ngay trên máy của bạn, không gửi đi đâu.</p>
       </div>
+      <div class="badge" id="badge" hidden></div>
       <div class="hint" id="hint" hidden></div>
     </div>
     <div class="bar">
       <button id="snapBtn" disabled>Chụp ảnh</button>
       <button id="stopBtn" disabled>Tắt webcam</button>
+      <label class="check" style="margin-top:0"><input type="checkbox" id="skeletonBox"> Hiện khung xương</label>
     </div>
 
     <div class="card ai">
@@ -130,7 +140,7 @@
       <div class="controls" hidden>
         <label class="check"><input type="checkbox" data-k="removeBg" checked> Xoá nền ảnh (nền trắng hoặc một màu)</label>
         <div class="row"><label>Độ xoá nền</label><input type="range" data-k="tol" min="5" max="120" value="40"></div>
-        <div class="row"><label>Cỡ</label><input type="range" data-k="scale" min="60" max="160" value="100"></div>
+        <div class="row"><label>Cỡ</label><input type="range" data-k="scale" min="60" max="220" value="100"></div>
         <div class="row"><label>Lên / xuống</label><input type="range" data-k="dy" min="-50" max="50" value="0"></div>
         <div class="row"><label>Trái / phải</label><input type="range" data-k="dx" min="-50" max="50" value="0"></div>
       </div>
@@ -147,7 +157,7 @@
       <div class="controls" hidden>
         <label class="check"><input type="checkbox" data-k="removeBg" checked> Xoá nền ảnh (nền trắng hoặc một màu)</label>
         <div class="row"><label>Độ xoá nền</label><input type="range" data-k="tol" min="5" max="120" value="40"></div>
-        <div class="row"><label>Cỡ</label><input type="range" data-k="scale" min="60" max="160" value="100"></div>
+        <div class="row"><label>Cỡ</label><input type="range" data-k="scale" min="60" max="220" value="100"></div>
         <div class="row"><label>Lên / xuống</label><input type="range" data-k="dy" min="-50" max="50" value="0"></div>
         <div class="row"><label>Trái / phải</label><input type="range" data-k="dx" min="-50" max="50" value="0"></div>
       </div>
@@ -175,15 +185,19 @@ const overlay = $("overlay"), statusEl = $("status"), hintEl = $("hint");
 const startBtn = $("startBtn"), stopBtn = $("stopBtn"), snapBtn = $("snapBtn");
 const aiBtn = $("aiBtn"), aiStatus = $("aiStatus"), aiResult = $("aiResult");
 const aiLink = $("aiLink"), aiLinkWrap = $("aiLinkWrap"), keyInput = $("falKey");
+const badge = $("badge"), skeletonBox = $("skeletonBox");
 let countdown = "";
 
-// Mỗi món đồ: ảnh gốc, ảnh đã xử lý (xoá nền + cắt sát), và các tinh chỉnh.
-// ax, ay: điểm trên ảnh (tỉ lệ 0–1) sẽ được đặt vào giữa vai (áo) hoặc giữa hông (quần).
-// widthK: bề ngang món đồ so với khoảng cách hai vai / hai khớp hông.
-const slots = {
-  top:    { front: { src: null, img: null }, back: { src: null, img: null }, facing: "front", removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, ax: 0.5, ay: 0.13, widthK: 2.05, pose: null },
-  bottom: { front: { src: null, img: null }, back: { src: null, img: null }, facing: "front", removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, ax: 0.5, ay: 0.06, widthK: 2.3,  pose: null },
-};
+// Lớp vẽ riêng cho quần áo: vẽ đủ các mảnh ở đây rồi mới chồng lên hình webcam,
+// nhờ vậy khi làm mờ dần không bị lộ đường nối giữa thân áo và tay áo.
+const layer = document.createElement("canvas"), lctx = layer.getContext("2d");
+
+// Mỗi món có ảnh mặt trước và mặt sau. `model` là kết quả phân tích ảnh (thân, vai, tay áo).
+const mkSlot = () => ({
+  front: { src: null, model: null }, back: { src: null, model: null },
+  facing: "front", removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, alpha: 0,
+});
+const slots = { top: mkSlot(), bottom: mkSlot() };
 
 let landmarker = null, stream = null, running = false, lastVideoTime = -1;
 
@@ -284,12 +298,113 @@ function samplePants() {
   return c;
 }
 
+/* ---------- Phân tích ảnh áo: tìm thân, đường vai và hai tay áo ---------- */
+
+const median = (a) => { const b = a.slice().sort((x, y) => x - y); return b[b.length >> 1]; };
+
+// Trả về mô hình áo: vùng thân (cột torsoL..torsoR), hàng ngang vai yS,
+// và mỗi tay áo được "duỗi thẳng" thành một ảnh riêng nằm dọc theo trục vai → cổ tay áo.
+function analyzeTop(img) {
+  const W = img.width, H = img.height;
+  const d = img.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, W, H).data;
+  const op = (x, y) => d[(y * W + x) * 4 + 3] > 40;
+
+  let total = 0, sumX = 0;
+  for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) if (op(x, y)) { total++; sumX += x; }
+  const model = { img, W, H, torsoL: 0, torsoR: W - 1, yS: Math.round(H * 0.1), sleeves: { L: null, R: null } };
+  if (!total) return finish(model);
+  const cx = Math.round(sumX / total);
+
+  // Thân áo: ở nửa dưới của áo, đoạn liền chứa cột giữa chính là thân.
+  const lefts = [], rights = [];
+  for (let y = Math.round(H * 0.6); y < Math.round(H * 0.92); y++) {
+    if (!op(cx, y)) continue;
+    let l = cx, r = cx;
+    while (l > 0 && op(l - 1, y)) l--;
+    while (r < W - 1 && op(r + 1, y)) r++;
+    lefts.push(l); rights.push(r);
+  }
+  if (lefts.length >= 5) {
+    // Lấy mép rộng nhất của thân (bỏ qua vài hàng nhiễu) và nới thêm một chút,
+    // để mép thân hơi xiên không bị tính nhầm thành tay áo.
+    const sl = lefts.slice().sort((x, y) => x - y), sr = rights.slice().sort((x, y) => x - y);
+    const l = sl[Math.floor(sl.length * 0.1)], r = sr[Math.floor(sr.length * 0.9)];
+    if (r - l + 1 >= W * 0.25) {
+      const pad = Math.max(2, Math.round((r - l) * 0.015));
+      model.torsoL = Math.max(0, l - pad); model.torsoR = Math.min(W - 1, r + pad);
+    }
+  }
+  const tw = model.torsoR - model.torsoL + 1;
+
+  // Đường vai: hàng đầu tiên mà vải phủ gần hết bề ngang thân (cổ áo, mũ trùm thì hẹp hơn).
+  for (let y = 0; y < H * 0.6; y++) {
+    let n = 0;
+    for (let x = model.torsoL; x <= model.torsoR; x += 2) if (op(x, y)) n += 2;
+    if (n >= tw * 0.8) { model.yS = y; break; }
+  }
+
+  // Tay áo: phần vải nằm ngoài thân ở mỗi bên.
+  for (const side of ["L", "R"]) {
+    const edge = side === "L" ? model.torsoL : model.torsoR;
+    const x0 = side === "L" ? 0 : edge + 1, x1 = side === "L" ? edge - 1 : W - 1;
+    const col = side === "L" ? edge - 2 : edge + 2;
+    if (col < 1 || col > W - 2) continue;
+    let n = 0;
+    for (let y = 0; y < H; y += 2) for (let x = x0; x <= x1; x += 2) if (op(x, y)) n++;
+    if (n < total * 0.012) continue;
+
+    // Nách áo: đoạn vải liền đầu tiên trên cột sát mép thân.
+    let y0 = -1, y1 = -1;
+    for (let y = 0; y < H; y++) {
+      if (op(col, y)) { if (y0 < 0) y0 = y; y1 = y; }
+      else if (y0 >= 0) break;
+    }
+    if (y0 < 0) continue;
+    // Điểm xoay của tay áo nằm gần đỉnh vai (khớp vai), không phải giữa nách.
+    const A = { x: edge, y: y0 + (y1 - y0) * 0.25 };
+
+    // Trục tay áo: từ nách đi qua trọng tâm của phần vải tay áo.
+    let bx = 0, by = 0, bn = 0, dmax = 0;
+    for (let y = 0; y < H; y += 2) for (let x = x0; x <= x1; x += 2) if (op(x, y)) {
+      bx += x; by += y; bn++;
+      const dd = Math.hypot(x - A.x, y - A.y); if (dd > dmax) dmax = dd;
+    }
+    if (!bn || dmax < tw * 0.08) continue;
+    const ang = Math.atan2(by / bn - A.y, bx / bn - A.x);
+    const ux = Math.cos(ang), uy = Math.sin(ang);
+    let tmin = 0, tmax = 0, pmax = 0;
+    for (let y = 0; y < H; y += 2) for (let x = x0; x <= x1; x += 2) if (op(x, y)) {
+      const rx = x - A.x, ry = y - A.y, t = rx * ux + ry * uy, p = Math.abs(-rx * uy + ry * ux);
+      if (t < tmin) tmin = t; if (t > tmax) tmax = t; if (p > pmax) pmax = p;
+    }
+    tmin -= 2; tmax += 2; pmax += 2;
+    const c = document.createElement("canvas");
+    c.width = Math.ceil(tmax - tmin) + 2; c.height = Math.ceil(pmax * 2) + 2;
+    const ox = 1 - tmin, oy = pmax + 1, g = c.getContext("2d");
+    g.translate(ox, oy); g.rotate(-ang); g.translate(-A.x, -A.y);
+    g.beginPath();
+    if (side === "L") g.rect(0, 0, edge + 1, H); else g.rect(edge, 0, W - edge, H);
+    g.clip();
+    g.drawImage(img, 0, 0);
+    // Tay áo ngắn và rộng thì chỉ xoay theo cánh tay một phần, để vai áo không bị vểnh lên.
+    const stiff = clamp(tmax / (2 * pmax), 0.6, 1);
+    model.sleeves[side] = { canvas: c, ox, oy, tmin, tmax, ang, A, h: c.height, stiff };
+  }
+  return finish(model);
+
+  function finish(m) {
+    m.torsoW = m.torsoR - m.torsoL + 1;
+    m.cx = (m.torsoL + m.torsoR) / 2;
+    return m;
+  }
+}
+
 /* ---------- Giao diện từng món ---------- */
 
 const FACES = ["front", "back"];
-const hasAny = (s) => !!(s.front.img || s.back.img);
-// Ảnh đang dùng: đúng mặt đang quay về webcam, thiếu thì lấy mặt còn lại.
-const pick = (s) => s[s.facing].img || s.front.img || s.back.img;
+const hasAny = (s) => !!(s.front.model || s.back.model);
+// Mô hình đang dùng: đúng mặt đang quay về webcam, thiếu thì lấy mặt còn lại.
+const pick = (s) => s[s.facing].model || s.front.model || s.back.model;
 
 for (const card of document.querySelectorAll("[data-slot]")) {
   const name = card.dataset.slot, s = slots[name];
@@ -299,14 +414,16 @@ for (const card of document.querySelectorAll("[data-slot]")) {
   const refresh = () => {
     for (const f of FACES) {
       const face = s[f], thumb = card.querySelector('[data-thumb="' + f + '"]');
-      face.img = face.src ? processGarment(face.src, s.removeBg, s.tol) : null;
-      if (face.img) { thumb.src = face.img.toDataURL(); thumb.hidden = false; }
-      else thumb.hidden = true;
+      if (face.src) {
+        const img = processGarment(face.src, s.removeBg, s.tol);
+        face.model = name === "top" ? analyzeTop(img) : { img };
+        thumb.src = img.toDataURL(); thumb.hidden = false;
+      } else { face.model = null; thumb.hidden = true; }
     }
     const any = hasAny(s);
-    if (!any) s.pose = null;
     controls.hidden = !any; clearBtn.hidden = !any;
   };
+  s.refresh = refresh;
 
   for (const input of card.querySelectorAll("input[type=file]")) {
     input.addEventListener("change", async (e) => {
@@ -394,6 +511,7 @@ function stopCamera() {
   running = false;
   if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
   video.srcObject = null;
+  tracker.reset(); badge.hidden = true;
   stopBtn.disabled = true; snapBtn.disabled = true; aiBtn.disabled = true;
   hintEl.hidden = true;
   overlay.hidden = false;
@@ -508,123 +626,316 @@ aiBtn.addEventListener("click", async () => {
   }
 });
 
-/* ---------- Vẽ ---------- */
+/* ---------- Theo dõi cơ thể: làm mượt, dự đoán khi mất điểm ---------- */
 
 const VIS = 0.5;
-const ok = (p) => p && (p.visibility === undefined || p.visibility > VIS);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const TRACKED = [11, 12, 13, 14, 15, 16, 19, 20, 23, 24, 27, 28];
+const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 27], [24, 28]];
 
-// Toạ độ điểm trên khung hình đã lật gương (để giống soi gương).
-function pt(p, W, H) { return { x: (1 - p.x) * W, y: p.y * H }; }
+// Toạ độ được lưu theo khung hình đã lật gương (giống soi gương), đơn vị là điểm ảnh.
+const tracker = {
+  pts: {},
+  update(lm, now, W, H) {
+    for (const i of TRACKED) {
+      const p = lm ? lm[i] : null, st = this.pts[i];
+      if (p && (p.visibility === undefined || p.visibility > VIS)) {
+        const x = (1 - p.x) * W, y = p.y * H, z = (p.z || 0) * W;
+        if (!st) { this.pts[i] = { x, y, z, vx: 0, vy: 0, seen: now, t: now, pred: false }; continue; }
+        const dt = Math.max(1, now - st.t), dist = Math.hypot(x - st.x, y - st.y);
+        // Rung nhẹ thì làm mượt mạnh, chuyển động lớn thì bám nhanh.
+        const a = clamp(dist / (0.02 * W), 0.3, 0.9);
+        const nx = st.x + (x - st.x) * a, ny = st.y + (y - st.y) * a;
+        st.vx = st.vx * 0.5 + ((nx - st.x) / dt) * 0.5;
+        st.vy = st.vy * 0.5 + ((ny - st.y) / dt) * 0.5;
+        st.x = nx; st.y = ny; st.z += (z - st.z) * 0.15;
+        st.seen = now; st.t = now; st.pred = false;
+      } else if (st) {
+        // Mất điểm tạm thời: đoán tiếp theo đà chuyển động trong chốc lát rồi mới bỏ.
+        if (now - st.seen < 450) {
+          const dt = now - st.t;
+          st.x += st.vx * dt * 0.6; st.y += st.vy * dt * 0.6;
+          st.vx *= 0.8; st.vy *= 0.8; st.t = now; st.pred = true;
+        } else delete this.pts[i];
+      }
+    }
+  },
+  get(i) { return this.pts[i] || null; },
+  reset() { this.pts = {}; },
+};
 
-// Làm mượt chuyển động để món đồ không bị rung.
-function smooth(prev, next, a) {
-  if (!prev) return next;
-  let da = next.angle - prev.angle;
-  while (da > Math.PI) da -= 2 * Math.PI;
-  while (da < -Math.PI) da += 2 * Math.PI;
-  return {
-    x: prev.x + (next.x - prev.x) * a,
-    y: prev.y + (next.y - prev.y) * a,
-    w: prev.w + (next.w - prev.w) * a,
-    h: prev.h + (next.h - prev.h) * a,
-    angle: prev.angle + da * a,
-  };
+/* ---------- Hình học ---------- */
+
+const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
+const len = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
+function inPoly(p, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > p.y) !== (b.y > p.y) && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
 }
 
-function drawGarment(s) {
-  const img = pick(s);
-  if (!img) return;
-  const p = s.pose, k = s.scale / 100;
-  const w = p.w * k, h = p.h * k;
+// Vẽ một tam giác của ảnh nguồn vào một tam giác đích (biến đổi affine từng mảnh).
+function drawTri(g, img, s0, s1, s2, d0, d1, d2) {
+  const sx1 = s1.x - s0.x, sy1 = s1.y - s0.y, sx2 = s2.x - s0.x, sy2 = s2.y - s0.y;
+  const det = sx1 * sy2 - sx2 * sy1;
+  if (Math.abs(det) < 1e-6) return;
+  const dx1 = d1.x - d0.x, dy1 = d1.y - d0.y, dx2 = d2.x - d0.x, dy2 = d2.y - d0.y;
+  const a = (dx1 * sy2 - dx2 * sy1) / det, c = (dx2 * sx1 - dx1 * sx2) / det;
+  const b = (dy1 * sy2 - dy2 * sy1) / det, d = (dy2 * sx1 - dy1 * sx2) / det;
+  const e = d0.x - a * s0.x - c * s0.y, f = d0.y - b * s0.x - d * s0.y;
+  // Nới tam giác ra một chút để không lộ khe giữa các mảnh.
+  const cx = (d0.x + d1.x + d2.x) / 3, cy = (d0.y + d1.y + d2.y) / 3;
+  const ex = (p) => { const vx = p.x - cx, vy = p.y - cy, l = Math.hypot(vx, vy) || 1; return [p.x + (vx / l) * 0.8, p.y + (vy / l) * 0.8]; };
+  g.save();
+  g.beginPath(); g.moveTo(...ex(d0)); g.lineTo(...ex(d1)); g.lineTo(...ex(d2)); g.closePath(); g.clip();
+  g.transform(a, b, c, d, e, f);
+  const bx = Math.max(0, Math.floor(Math.min(s0.x, s1.x, s2.x)) - 1), by = Math.max(0, Math.floor(Math.min(s0.y, s1.y, s2.y)) - 1);
+  const bw = Math.min(img.width - bx, Math.ceil(Math.max(s0.x, s1.x, s2.x)) + 2 - bx), bh = Math.min(img.height - by, Math.ceil(Math.max(s0.y, s1.y, s2.y)) + 2 - by);
+  if (bw > 0 && bh > 0) g.drawImage(img, bx, by, bw, bh, bx, by, bw, bh);
+  g.restore();
+}
+
+/* ---------- Mặc áo: lưới biến dạng theo thân + tay áo theo cánh tay ---------- */
+
+// Trả về các vùng tay/bàn tay cần hiện đè lên áo (để vẽ lại từ hình webcam).
+function drawTop(g, s, W) {
+  const m = pick(s);
+  const a = tracker.get(11), b = tracker.get(12);
+  if (!m || !a || !b) return null;
+  // Sắp theo vị trí trên màn hình: bên trái màn hình ↔ bên trái của ảnh áo.
+  const flip = a.x > b.x;
+  const SL = flip ? b : a, SR = flip ? a : b;
+  const armL = flip ? [14, 16, 20] : [13, 15, 19], armR = flip ? [13, 15, 19] : [14, 16, 20];
+  const shW = len(SL, SR);
+  if (shW < 8) return null;
+  const shAng = Math.atan2(SR.y - SL.y, SR.x - SL.x);
+  const SM = mid(SL, SR);
+
+  let spine = { x: -Math.sin(shAng), y: Math.cos(shAng) }, torsoLen = shW * 1.45, hipAng = shAng;
+  const h1 = tracker.get(23), h2 = tracker.get(24);
+  if (h1 && h2) {
+    const HL = h1.x <= h2.x ? h1 : h2, HR = h1.x <= h2.x ? h2 : h1, HM = mid(HL, HR), L = len(HM, SM);
+    if (L > shW * 0.5) {
+      torsoLen = L; spine = { x: (HM.x - SM.x) / L, y: (HM.y - SM.y) / L };
+      hipAng = shAng + clamp(angDiff(Math.atan2(HR.y - HL.y, HR.x - HL.x), shAng), -0.5, 0.5);
+    }
+  }
+
+  const targetW = shW * 1.28 * (s.scale / 100), sc = targetW / m.torsoW;
+  // Xoay người nhẹ: vai nào lùi ra sau thì đường giữa ngực dịch về phía đó.
+  const yaw = clamp((SL.z - SR.z) / Math.max(shW, torsoLen * 0.3), -0.6, 0.6);
+  const cs = Math.cos(shAng), sn = Math.sin(shAng);
+  const O = {
+    x: SM.x + cs * (s.dx / 100) * targetW + spine.x * (s.dy / 100) * targetW,
+    y: SM.y + sn * (s.dx / 100) * targetW + spine.y * (s.dy / 100) * targetW,
+  };
+  const map = (gx, gy) => {
+    let u = (gx - m.cx) / m.torsoW;
+    const v = (gy - m.yS) * sc, t = clamp(v / torsoLen, 0, 1);
+    const ang = shAng + (hipAng - shAng) * t;
+    if (Math.abs(u) <= 0.5) u -= yaw * 0.2 * (1 - 4 * u * u);
+    return { x: O.x + spine.x * v + Math.cos(ang) * u * targetW, y: O.y + spine.y * v + Math.sin(ang) * u * targetW };
+  };
+
+  const poly = [map(m.torsoL, m.yS), map(m.torsoR, m.yS), map(m.torsoR, m.H), map(m.torsoL, m.H)];
+  const after = [], skin = [];
+
+  const sleeve = (side, idx) => {
+    const sl = m.sleeves[side];
+    const el = tracker.get(idx[0]), wr = tracker.get(idx[1]), ix = tracker.get(idx[2]);
+    const elIn = !!el && inPoly(el, poly), wrIn = !!wr && inPoly(wr, poly);
+    let covered = 0;
+    if (sl) {
+      const P0 = map(sl.A.x, sl.A.y);
+      let th1 = sl.ang + shAng, tE = Infinity;
+      if (el && len(el, P0) > 4) {
+        tE = len(el, P0) / sc;
+        const want = Math.atan2(el.y - P0.y, el.x - P0.x);
+        th1 = tE < sl.tmax ? want : th1 + angDiff(want, th1) * sl.stiff;
+      }
+      const seg = (origin, th, t0, t1, tStart) => () => {
+        if (t1 - t0 < 0.5) return;
+        g.save();
+        g.translate(origin.x, origin.y); g.rotate(th); g.scale(sc, sc);
+        g.drawImage(sl.canvas, sl.ox + t0, 0, t1 - t0, sl.h, t0 - tStart, -sl.oy, t1 - t0, sl.h);
+        g.restore();
+      };
+      const upper = seg(P0, th1, sl.tmin, Math.min(sl.tmax, tE + 3 / sc), 0);
+      if (elIn) after.push(upper); else upper();
+      if (tE < sl.tmax) {
+        // Tay áo dài hơn bắp tay: phần còn lại gập theo cẳng tay.
+        const th2 = wr ? Math.atan2(wr.y - el.y, wr.x - el.x) : th1;
+        const lower = seg(el, th2, Math.max(sl.tmin, tE - 2 / sc), sl.tmax, tE);
+        if (elIn || wrIn) after.push(lower); else lower();
+        covered = (sl.tmax - tE) * sc;
+      }
+    }
+    // Tay đưa ra trước ngực: phần cẳng tay không có tay áo che và bàn tay phải hiện đè lên áo.
+    if (el && wr && (wrIn || inPoly(mid(el, wr), poly))) {
+      const L = len(el, wr), r = Math.max(6, torsoLen * 0.075);
+      if (L > covered + 4) {
+        const k = Math.min(covered, L) / L;
+        skin.push({ a: { x: el.x + (wr.x - el.x) * k, y: el.y + (wr.y - el.y) * k }, b: wr, r });
+      }
+      const tip = ix ? { x: wr.x + (ix.x - wr.x) * 1.6, y: wr.y + (ix.y - wr.y) * 1.6 } : wr;
+      skin.push({ a: wr, b: tip, r: r * 1.35 });
+    }
+  };
+  sleeve("L", armL);
+  sleeve("R", armR);
+
+  // Thân áo: lưới 4 × 6 ô, mỗi ô hai tam giác, uốn theo đường vai, cột sống và đường hông.
+  const NX = 4, NY = 6, x0 = Math.max(0, m.torsoL - 1), x1 = Math.min(m.W, m.torsoR + 2);
+  const src = [], dst = [];
+  for (let j = 0; j <= NY; j++) for (let i = 0; i <= NX; i++) {
+    const p = { x: x0 + ((x1 - x0) * i) / NX, y: (m.H * j) / NY };
+    src.push(p); dst.push(map(p.x, p.y));
+  }
+  for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+    const k = j * (NX + 1) + i, k2 = k + NX + 1;
+    drawTri(g, m.img, src[k], src[k + 1], src[k2], dst[k], dst[k + 1], dst[k2]);
+    drawTri(g, m.img, src[k + 1], src[k2 + 1], src[k2], dst[k + 1], dst[k2 + 1], dst[k2]);
+  }
+  for (const f of after) f();
+  return skin;
+}
+
+function drawBottom(g, s) {
+  const m = pick(s), h1 = tracker.get(23), h2 = tracker.get(24);
+  if (!m || !h1 || !h2) return false;
+  const a = h1.x <= h2.x ? h1 : h2, b = h1.x <= h2.x ? h2 : h1;
+  const hipW = len(a, b), c = mid(a, b), k = s.scale / 100;
+  const w = hipW * 2.3 * k;
+  let h = (w * m.img.height) / m.img.width;
+  // Nếu thấy mắt cá chân thì kéo ống quần dài tới đó.
+  const k1 = tracker.get(27), k2 = tracker.get(28);
+  if (k1 && k2) h = len(mid(k1, k2), c) * 1.12 * k;
+  g.save();
+  g.translate(c.x, c.y);
+  g.rotate(Math.atan2(b.y - a.y, b.x - a.x));
+  g.drawImage(m.img, -w * 0.5 + (s.dx / 100) * w, -h * 0.06 + (s.dy / 100) * h, w, h);
+  g.restore();
+  return true;
+}
+
+function capsulePath(g, c) {
+  const ang = Math.atan2(c.b.y - c.a.y, c.b.x - c.a.x);
+  g.moveTo(c.b.x + Math.cos(ang - Math.PI / 2) * c.r, c.b.y + Math.sin(ang - Math.PI / 2) * c.r);
+  g.arc(c.b.x, c.b.y, c.r, ang - Math.PI / 2, ang + Math.PI / 2);
+  g.arc(c.a.x, c.a.y, c.r, ang + Math.PI / 2, ang + (3 * Math.PI) / 2);
+  g.closePath();
+}
+
+// Vẽ toàn bộ quần áo lên khung hình hiện tại. `drawBg` vẽ lại hình webcam (đã lật gương).
+function renderScene(W, H, drawBg) {
+  const top = slots.top, bot = slots.bottom;
+  const sA = tracker.get(11), sB = tracker.get(12), hA = tracker.get(23), hB = tracker.get(24);
+  let hint = "", state = "lost";
+
+  // Quay mặt hay quay lưng: vai trái của người nằm bên trái hình (đã lật gương) khi quay mặt lại.
+  const pair = sA && sB ? [sA, sB] : hA && hB ? [hA, hB] : null;
+  if (pair) {
+    const dx = pair[1].x - pair[0].x, thr = 0.04 * W;
+    const facing = dx > thr ? "front" : dx < -thr ? "back" : top.facing;
+    top.facing = bot.facing = facing;
+  }
+  const topOk = !!(sA && sB), botOk = !!(hA && hB);
+  if (topOk) state = sA.pred || sB.pred ? "pred" : "ok";
+  else if (botOk) state = hA.pred || hB.pred ? "pred" : "ok";
+
+  // Bám kém thì áo mờ dần thay vì nhảy lung tung.
+  top.alpha += ((topOk && !sA.pred && !sB.pred ? 1 : 0) - top.alpha) * 0.25;
+  bot.alpha += ((botOk && !hA.pred && !hB.pred ? 1 : 0) - bot.alpha) * 0.25;
+
+  if (layer.width !== W || layer.height !== H) { layer.width = W; layer.height = H; }
+
+  if (hasAny(bot) && bot.alpha > 0.02) {
+    lctx.clearRect(0, 0, W, H);
+    if (drawBottom(lctx, bot)) { ctx.globalAlpha = bot.alpha; ctx.drawImage(layer, 0, 0); ctx.globalAlpha = 1; }
+  }
+  if (hasAny(top) && top.alpha > 0.02) {
+    lctx.clearRect(0, 0, W, H);
+    const skin = drawTop(lctx, top, W);
+    if (skin) {
+      ctx.globalAlpha = top.alpha; ctx.drawImage(layer, 0, 0); ctx.globalAlpha = 1;
+      if (skin.length && top.alpha > 0.5) {
+        ctx.save();
+        ctx.beginPath();
+        for (const c of skin) capsulePath(ctx, c);
+        ctx.clip();
+        drawBg();
+        ctx.restore();
+      }
+    }
+  }
+
+  if (!hasAny(top) && !hasAny(bot)) hint = "Thêm ảnh áo hoặc quần ở phần bên dưới để bắt đầu thử.";
+  else if (!topOk && !botOk) hint = "Chưa thấy người trong khung hình. Hãy đứng vào giữa webcam.";
+  else if (hasAny(bot) && !botOk) hint = "Lùi ra xa hơn để webcam thấy được hông và chân thì mới thử quần được.";
+  else if (hasAny(top) && !topOk) hint = "Chưa thấy rõ hai vai. Hãy quay thẳng người về phía webcam.";
+
+  if (skeletonBox.checked) {
+    ctx.save();
+    ctx.lineWidth = 3; ctx.strokeStyle = "rgba(255,180,84,.9)"; ctx.fillStyle = "#fff";
+    for (const [i, j] of BONES) {
+      const p = tracker.get(i), q = tracker.get(j);
+      if (p && q) { ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+    }
+    for (const i of TRACKED) { const p = tracker.get(i); if (p) { ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7); ctx.fill(); } }
+    ctx.restore();
+  }
+  return { hint, state };
+}
+
+/* ---------- Vòng lặp chính ---------- */
+
+const STATE_TEXT = { ok: "Đang bám theo cơ thể", pred: "Bám yếu, đang dự đoán", lost: "Chưa thấy cơ thể" };
+const fps = { frames: 0, detects: 0, t: 0, text: "" };
+
+function drawVideo() {
+  const W = canvas.width, H = canvas.height;
   ctx.save();
-  ctx.translate(p.x, p.y);
-  ctx.rotate(p.angle);
-  ctx.drawImage(img, -w * s.ax + (s.dx / 100) * w, -h * s.ay + (s.dy / 100) * h, w, h);
+  ctx.translate(W, 0); ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, W, H);
   ctx.restore();
 }
 
 function loop() {
   if (!running) return;
-  const W = canvas.width, H = canvas.height;
+  const W = canvas.width, H = canvas.height, now = performance.now();
+  drawVideo();
 
-  ctx.save();
-  ctx.translate(W, 0); ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, W, H);
-  ctx.restore();
-
-  let lm = null;
   if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
     lastVideoTime = video.currentTime;
     try {
-      const res = landmarker.detectForVideo(video, performance.now());
-      lm = res.landmarks && res.landmarks[0] ? res.landmarks[0] : null;
-      loop.last = lm;
-    } catch (e) { lm = loop.last || null; }
-  } else {
-    lm = loop.last || null;
+      const res = landmarker.detectForVideo(video, now);
+      tracker.update(res.landmarks && res.landmarks[0] ? res.landmarks[0] : null, now, W, H);
+      fps.detects++;
+    } catch (e) { /* bỏ qua khung hình lỗi, giữ kết quả trước đó */ }
   }
 
-  let hint = "";
-  const top = slots.top, bot = slots.bottom;
-  if (!hasAny(top) && !hasAny(bot)) hint = "Thêm ảnh áo hoặc quần ở bảng bên cạnh để bắt đầu thử.";
-  else if (!lm) hint = "Chưa thấy người trong khung hình. Hãy đứng vào giữa webcam.";
+  const out = renderScene(W, H, drawVideo);
+  setHint(countdown || out.hint);
 
-  if (lm) {
-    // Đang quay mặt hay quay lưng về webcam? Trên hình đã lật gương, vai trái của người
-    // nằm bên trái khi quay mặt lại, và sang bên phải khi quay lưng.
-    const sA = ok(lm[11]) && ok(lm[12]) ? [lm[11], lm[12]] : ok(lm[23]) && ok(lm[24]) ? [lm[23], lm[24]] : null;
-    if (sA) {
-      const dx = (sA[0].x - sA[1].x) * W, thr = 0.04 * W;
-      const facing = dx > thr ? "front" : dx < -thr ? "back" : top.facing;
-      top.facing = bot.facing = facing;
-    }
-    // Quần vẽ trước, áo vẽ sau để vạt áo phủ lên cạp quần.
-    if (hasAny(bot)) {
-      const L = lm[23], R = lm[24], img = pick(bot);
-      if (ok(L) && ok(R)) {
-        let a = pt(L, W, H), b = pt(R, W, H);
-        if (a.x > b.x) [a, b] = [b, a];
-        const hipW = Math.hypot(b.x - a.x, b.y - a.y);
-        const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-        const w = hipW * bot.widthK;
-        let h = w * img.height / img.width;
-        // Nếu thấy mắt cá chân thì kéo ống quần dài tới đó.
-        if (ok(lm[27]) && ok(lm[28])) {
-          const la = pt(lm[27], W, H), ra = pt(lm[28], W, H);
-          const leg = Math.hypot((la.x + ra.x) / 2 - mid.x, (la.y + ra.y) / 2 - mid.y);
-          h = leg * 1.12;
-        }
-        const next = { x: mid.x, y: mid.y, w, h, angle: Math.atan2(b.y - a.y, b.x - a.x) };
-        bot.pose = smooth(bot.pose, next, 0.4);
-        drawGarment(bot);
-      } else {
-        bot.pose = null;
-        hint = "Lùi ra xa hơn để webcam thấy được hông và chân thì mới thử quần được.";
-      }
-    }
-    if (hasAny(top)) {
-      const L = lm[11], R = lm[12], img = pick(top);
-      if (ok(L) && ok(R)) {
-        let a = pt(L, W, H), b = pt(R, W, H);
-        if (a.x > b.x) [a, b] = [b, a];
-        const shW = Math.hypot(b.x - a.x, b.y - a.y);
-        const w = shW * top.widthK;
-        const next = {
-          x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, w,
-          h: w * img.height / img.width,
-          angle: Math.atan2(b.y - a.y, b.x - a.x),
-        };
-        top.pose = smooth(top.pose, next, 0.4);
-        drawGarment(top);
-      } else {
-        top.pose = null;
-        if (!hint) hint = "Chưa thấy rõ hai vai. Hãy quay thẳng người về phía webcam.";
-      }
-    }
+  // Tốc độ đo thật trên máy đang chạy, cập nhật mỗi giây.
+  fps.frames++;
+  if (now - fps.t >= 1000) {
+    fps.text = Math.round((fps.detects * 1000) / (now - fps.t)) + " lần nhận diện/giây";
+    fps.frames = 0; fps.detects = 0; fps.t = now;
   }
-  setHint(countdown || hint);
+  badge.hidden = false;
+  badge.textContent = STATE_TEXT[out.state] + (fps.text ? " · " + fps.text : "");
+  badge.dataset.state = out.state;
   requestAnimationFrame(loop);
 }
+
+// Dùng cho kiểm thử tự động (không ảnh hưởng tới người dùng).
+window.__vto = { slots, tracker, renderScene, canvas, ctx };
 </script>
 </body>
 </html>
