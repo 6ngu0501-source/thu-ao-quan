@@ -60,8 +60,9 @@
   .thumb {
     width: 44px; height: 44px; border-radius: 8px; border: 1px solid var(--line);
     background: repeating-conic-gradient(#2a2e36 0 25%, #1e2127 0 50%) 0 0 / 12px 12px;
-    object-fit: contain; margin-left: auto;
+    object-fit: contain;
   }
+  .thumbs { margin-left: auto; display: flex; gap: 6px; }
   .row { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 10px; margin-top: 8px; }
   .row label { color: var(--muted); font-size: 14px; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
@@ -98,9 +99,10 @@
 
   <aside>
     <div class="card" data-slot="top">
-      <h2>Áo <img class="thumb" alt="" hidden></h2>
+      <h2>Áo <span class="thumbs"><img class="thumb" data-thumb="front" alt="Mặt trước" hidden><img class="thumb" data-thumb="back" alt="Mặt sau" hidden></span></h2>
       <div class="bar" style="margin-top:0">
-        <label class="filebtn primary">Thêm ảnh áo<input type="file" accept="image/*"></label>
+        <label class="filebtn primary">Ảnh mặt trước<input type="file" accept="image/*" data-face="front"></label>
+        <label class="filebtn">Ảnh mặt sau<input type="file" accept="image/*" data-face="back"></label>
         <button data-act="sample">Dùng áo mẫu</button>
         <button data-act="clear" hidden>Bỏ</button>
       </div>
@@ -114,9 +116,10 @@
     </div>
 
     <div class="card" data-slot="bottom">
-      <h2>Quần <img class="thumb" alt="" hidden></h2>
+      <h2>Quần <span class="thumbs"><img class="thumb" data-thumb="front" alt="Mặt trước" hidden><img class="thumb" data-thumb="back" alt="Mặt sau" hidden></span></h2>
       <div class="bar" style="margin-top:0">
-        <label class="filebtn primary">Thêm ảnh quần<input type="file" accept="image/*"></label>
+        <label class="filebtn primary">Ảnh mặt trước<input type="file" accept="image/*" data-face="front"></label>
+        <label class="filebtn">Ảnh mặt sau<input type="file" accept="image/*" data-face="back"></label>
         <button data-act="sample">Dùng quần mẫu</button>
         <button data-act="clear" hidden>Bỏ</button>
       </div>
@@ -132,7 +135,8 @@
     <div class="card tips">
       <strong style="color:var(--text)">Mẹo để lên hình đẹp</strong>
       <ul>
-        <li>Dùng ảnh chụp thẳng mặt trước món đồ, trải phẳng, trên nền trắng hoặc một màu.</li>
+        <li>Dùng ảnh chỉ có món đồ (không có người mặc), trải phẳng, trên nền trắng hoặc một màu.</li>
+        <li>Thêm cả ảnh mặt sau: khi bạn quay lưng lại, app tự đổi sang mặt sau.</li>
         <li>Đứng thẳng, cách webcam 1,5–2 m. Thử quần thì cần thấy từ hông tới mắt cá.</li>
         <li>Chỗ đủ sáng giúp nhận diện cơ thể ổn định hơn.</li>
       </ul>
@@ -153,8 +157,8 @@ const startBtn = $("startBtn"), stopBtn = $("stopBtn"), snapBtn = $("snapBtn");
 // ax, ay: điểm trên ảnh (tỉ lệ 0–1) sẽ được đặt vào giữa vai (áo) hoặc giữa hông (quần).
 // widthK: bề ngang món đồ so với khoảng cách hai vai / hai khớp hông.
 const slots = {
-  top:    { src: null, img: null, removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, ax: 0.5, ay: 0.13, widthK: 2.05, pose: null },
-  bottom: { src: null, img: null, removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, ax: 0.5, ay: 0.06, widthK: 2.3,  pose: null },
+  top:    { front: { src: null, img: null }, back: { src: null, img: null }, facing: "front", removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, ax: 0.5, ay: 0.13, widthK: 2.05, pose: null },
+  bottom: { front: { src: null, img: null }, back: { src: null, img: null }, facing: "front", removeBg: true, tol: 40, scale: 100, dx: 0, dy: 0, ax: 0.5, ay: 0.06, widthK: 2.3,  pose: null },
 };
 
 let landmarker = null, stream = null, running = false, lastVideoTime = -1;
@@ -258,37 +262,45 @@ function samplePants() {
 
 /* ---------- Giao diện từng món ---------- */
 
+const FACES = ["front", "back"];
+const hasAny = (s) => !!(s.front.img || s.back.img);
+// Ảnh đang dùng: đúng mặt đang quay về webcam, thiếu thì lấy mặt còn lại.
+const pick = (s) => s[s.facing].img || s.front.img || s.back.img;
+
 for (const card of document.querySelectorAll("[data-slot]")) {
   const name = card.dataset.slot, s = slots[name];
-  const thumb = card.querySelector(".thumb"), controls = card.querySelector(".controls");
+  const controls = card.querySelector(".controls");
   const clearBtn = card.querySelector('[data-act="clear"]');
 
   const refresh = () => {
-    if (!s.src) {
-      s.img = null; s.pose = null;
-      thumb.hidden = true; controls.hidden = true; clearBtn.hidden = true;
-      return;
+    for (const f of FACES) {
+      const face = s[f], thumb = card.querySelector('[data-thumb="' + f + '"]');
+      face.img = face.src ? processGarment(face.src, s.removeBg, s.tol) : null;
+      if (face.img) { thumb.src = face.img.toDataURL(); thumb.hidden = false; }
+      else thumb.hidden = true;
     }
-    s.img = processGarment(s.src, s.removeBg, s.tol);
-    thumb.src = s.img.toDataURL(); thumb.hidden = false;
-    controls.hidden = false; clearBtn.hidden = false;
+    const any = hasAny(s);
+    if (!any) s.pose = null;
+    controls.hidden = !any; clearBtn.hidden = !any;
   };
 
-  card.querySelector("input[type=file]").addEventListener("change", async (e) => {
-    const f = e.target.files[0];
-    e.target.value = "";
-    if (!f) return;
-    const url = URL.createObjectURL(f);
-    try { s.src = await loadImage(url); refresh(); }
-    catch (err) { setHint("Không đọc được ảnh này. Hãy thử ảnh JPG hoặc PNG khác."); }
-    finally { URL.revokeObjectURL(url); }
-  });
+  for (const input of card.querySelectorAll("input[type=file]")) {
+    input.addEventListener("change", async (e) => {
+      const f = e.target.files[0];
+      e.target.value = "";
+      if (!f) return;
+      const url = URL.createObjectURL(f);
+      try { s[input.dataset.face].src = await loadImage(url); refresh(); }
+      catch (err) { setHint("Không đọc được ảnh này. Hãy thử ảnh JPG hoặc PNG khác."); }
+      finally { URL.revokeObjectURL(url); }
+    });
+  }
 
   card.querySelector('[data-act="sample"]').addEventListener("click", () => {
-    s.src = name === "top" ? sampleShirt() : samplePants();
+    s.front.src = name === "top" ? sampleShirt() : samplePants();
     refresh();
   });
-  clearBtn.addEventListener("click", () => { s.src = null; refresh(); });
+  clearBtn.addEventListener("click", () => { s.front.src = null; s.back.src = null; refresh(); });
 
   for (const el of card.querySelectorAll("[data-k]")) {
     const key = el.dataset.k;
@@ -407,12 +419,14 @@ function smooth(prev, next, a) {
 }
 
 function drawGarment(s) {
+  const img = pick(s);
+  if (!img) return;
   const p = s.pose, k = s.scale / 100;
   const w = p.w * k, h = p.h * k;
   ctx.save();
   ctx.translate(p.x, p.y);
   ctx.rotate(p.angle);
-  ctx.drawImage(s.img, -w * s.ax + (s.dx / 100) * w, -h * s.ay + (s.dy / 100) * h, w, h);
+  ctx.drawImage(img, -w * s.ax + (s.dx / 100) * w, -h * s.ay + (s.dy / 100) * h, w, h);
   ctx.restore();
 }
 
@@ -439,19 +453,28 @@ function loop() {
 
   let hint = "";
   const top = slots.top, bot = slots.bottom;
-  if (!top.img && !bot.img) hint = "Thêm ảnh áo hoặc quần ở bảng bên cạnh để bắt đầu thử.";
+  if (!hasAny(top) && !hasAny(bot)) hint = "Thêm ảnh áo hoặc quần ở bảng bên cạnh để bắt đầu thử.";
   else if (!lm) hint = "Chưa thấy người trong khung hình. Hãy đứng vào giữa webcam.";
 
   if (lm) {
+    // Đang quay mặt hay quay lưng về webcam? Trên hình đã lật gương, vai trái của người
+    // nằm bên trái khi quay mặt lại, và sang bên phải khi quay lưng.
+    const sA = ok(lm[11]) && ok(lm[12]) ? [lm[11], lm[12]] : ok(lm[23]) && ok(lm[24]) ? [lm[23], lm[24]] : null;
+    if (sA) {
+      const dx = (sA[0].x - sA[1].x) * W, thr = 0.04 * W;
+      const facing = dx > thr ? "front" : dx < -thr ? "back" : top.facing;
+      top.facing = bot.facing = facing;
+    }
     // Quần vẽ trước, áo vẽ sau để vạt áo phủ lên cạp quần.
-    if (bot.img) {
-      const L = lm[23], R = lm[24];
+    if (hasAny(bot)) {
+      const L = lm[23], R = lm[24], img = pick(bot);
       if (ok(L) && ok(R)) {
-        const a = pt(L, W, H), b = pt(R, W, H);
+        let a = pt(L, W, H), b = pt(R, W, H);
+        if (a.x > b.x) [a, b] = [b, a];
         const hipW = Math.hypot(b.x - a.x, b.y - a.y);
         const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
         const w = hipW * bot.widthK;
-        let h = w * bot.img.height / bot.img.width;
+        let h = w * img.height / img.width;
         // Nếu thấy mắt cá chân thì kéo ống quần dài tới đó.
         if (ok(lm[27]) && ok(lm[28])) {
           const la = pt(lm[27], W, H), ra = pt(lm[28], W, H);
@@ -466,15 +489,16 @@ function loop() {
         hint = "Lùi ra xa hơn để webcam thấy được hông và chân thì mới thử quần được.";
       }
     }
-    if (top.img) {
-      const L = lm[11], R = lm[12];
+    if (hasAny(top)) {
+      const L = lm[11], R = lm[12], img = pick(top);
       if (ok(L) && ok(R)) {
-        const a = pt(L, W, H), b = pt(R, W, H);
+        let a = pt(L, W, H), b = pt(R, W, H);
+        if (a.x > b.x) [a, b] = [b, a];
         const shW = Math.hypot(b.x - a.x, b.y - a.y);
         const w = shW * top.widthK;
         const next = {
           x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, w,
-          h: w * top.img.height / top.img.width,
+          h: w * img.height / img.width,
           angle: Math.atan2(b.y - a.y, b.x - a.x),
         };
         top.pose = smooth(top.pose, next, 0.4);
